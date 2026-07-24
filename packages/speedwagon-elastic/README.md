@@ -12,11 +12,11 @@ npm install -g @scrawl-labs/speedwagon-elastic
 
 ### Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `ELASTICSEARCH_URL` | Yes | Elasticsearch endpoint (e.g. `https://es.example.com:9200`) |
-| `ELASTICSEARCH_API_KEY` | Yes | API key for authentication |
-| `ELASTICSEARCH_FIELD_MAP` | No | JSON field name mapping (see below) |
+| Variable                  | Required | Description                                                 |
+| ------------------------- | -------- | ----------------------------------------------------------- |
+| `ELASTICSEARCH_URL`       | Yes      | Elasticsearch endpoint (e.g. `https://es.example.com:9200`) |
+| `ELASTICSEARCH_API_KEY`   | Yes      | API key for authentication                                  |
+| `ELASTICSEARCH_FIELD_MAP` | No       | JSON field name mapping (see below)                         |
 
 ### API Key Setup
 
@@ -42,6 +42,8 @@ POST /_security/api_key
 ### Field Mapping
 
 Every team's log format is different. `ELASTICSEARCH_FIELD_MAP` lets you tell the server which fields to query — no code changes needed.
+
+`search_logs` and `error_summary` now include built-in fallback candidates (for example `parsed_log.status_code`, `parsed_log.url`, `app_name`, `log_name`) even when your field map is ECS-based. For best accuracy/performance, still set `ELASTICSEARCH_FIELD_MAP` to your real schema.
 
 **Default (ECS — Elastic Common Schema):**
 
@@ -98,20 +100,20 @@ You only need to override the fields that differ — unspecified fields fall bac
 
 ### Index Discovery
 
-| Tool | Description |
-|------|-------------|
+| Tool           | Description                                                   |
+| -------------- | ------------------------------------------------------------- |
 | `list_indices` | List indices with doc count and size. Filters system indices. |
 
 ### Log Search
 
-| Tool | Description |
-|------|-------------|
+| Tool          | Description                                                                                             |
+| ------------- | ------------------------------------------------------------------------------------------------------- |
 | `search_logs` | Search logs by free-text query, log level, user, URI, service, HTTP method, status code, and time range |
 
 ### Error Analysis
 
-| Tool | Description |
-|------|-------------|
+| Tool            | Description                                                                                  |
+| --------------- | -------------------------------------------------------------------------------------------- |
 | `error_summary` | Top error groups with counts + hourly trend. Group by message, URI, service, or status code. |
 
 ## Usage Examples
@@ -123,7 +125,17 @@ You only need to override the fields that differ — unspecified fields fall bac
 "gem-operation 서비스 에러 요약"   → error_summary (service: "gem-operation")
 "서비스별 에러 현황"              → error_summary (group_by: "service")
 "GET /api/ping 요청 확인"        → search_logs (method: "GET", uri: "/api/ping")
+"오늘 gem-operation 500 요약"    → error_summary (service: "gem-operation", group_by: "status_code")
 ```
+
+## Diagnostics
+
+`search_logs` and `error_summary` responses include `diagnostics`:
+
+- `configuredFallbacks`: logical field -> candidate field list
+- `appliedFallbacks`: which fallback clauses/fields were used during query execution
+
+Use this to confirm whether the tool matched your real log schema or only the default ECS fields.
 
 ## License
 

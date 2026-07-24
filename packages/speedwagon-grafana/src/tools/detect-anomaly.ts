@@ -1,28 +1,38 @@
 import { z } from "zod";
 import { grafanaGet, grafanaPost } from "../client.js";
+import {
+  buildPanelQueries,
+  flattenPanels,
+  getTemplateValueMap,
+  sanitizeNumericSeries,
+  type DashboardPanel,
+  type DashboardVariable,
+} from "./dashboard-utils.js";
 
 export const detectAnomalySchema = z.object({
   uid: z.string().describe("Dashboard UID"),
   panelId: z.number().describe("Panel ID"),
-  from: z.string().optional().default("now-6h").describe("Start time (default: now-6h)"),
+  from: z
+    .string()
+    .optional()
+    .default("now-6h")
+    .describe("Start time (default: now-6h)"),
   to: z.string().optional().default("now").describe("End time (default: now)"),
-  sensitivity: z.number().optional().default(2.5).describe("Z-score threshold for anomaly detection (default: 2.5, lower = more sensitive)"),
+  sensitivity: z
+    .number()
+    .optional()
+    .default(2.5)
+    .describe(
+      "Z-score threshold for anomaly detection (default: 2.5, lower = more sensitive)",
+    ),
 });
 
 export type DetectAnomalyInput = z.infer<typeof detectAnomalySchema>;
 
-interface Panel {
-  id: number;
-  title: string;
-  type: string;
-  datasource?: { type?: string; uid?: string } | null;
-  targets?: Array<Record<string, unknown>>;
-}
-
 interface DashboardResponse {
   dashboard: {
-    panels: Panel[];
-    time?: { from: string; to: string };
+    panels: DashboardPanel[];
+    templating?: { list?: DashboardVariable[] };
   };
 }
 
@@ -47,6 +57,7 @@ function computeStats(values: number[]): SeriesStats {
   const mean = values.reduce((a, b) => a + b, 0) / count;
   const variance = values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / count;
   const stddev = Math.sqrt(variance);
+
   return {
     mean,
     stddev,
@@ -83,14 +94,27 @@ function detectAnomalies(
   return anomalies;
 }
 
-function extractTimeSeries(frames: unknown): Array<{ name: string; timestamps: number[]; values: number[] }> {
-  const series: Array<{ name: string; timestamps: number[]; values: number[] }> = [];
+function extractTimeSeries(
+  frames: unknown,
+): Array<{ name: string; timestamps: number[]; values: number[] }> {
+  const series: Array<{
+    name: string;
+    timestamps: number[];
+    values: number[];
+  }> = [];
 
   const results = (frames as Record<string, unknown>)?.results;
   if (!results || typeof results !== "object") return series;
 
-  for (const [refId, refResult] of Object.entries(results as Record<string, unknown>)) {
-    const result = refResult as { frames?: Array<{ schema?: { fields?: Array<{ name: string; type: string }> }; data?: { values?: unknown[][] } }> };
+  for (const [refId, refResult] of Object.entries(
+    results as Record<string, unknown>,
+  )) {
+    const result = refResult as {
+      frames?: Array<{
+        schema?: { fields?: Array<{ name: string; type: string }> };
+        data?: { values?: unknown[][] };
+      }>;
+    };
     if (!result.frames) continue;
 
     for (const frame of result.frames) {
@@ -99,11 +123,14 @@ function extractTimeSeries(frames: unknown): Array<{ name: string; timestamps: n
 
       const timeIdx = fields.findIndex((f) => f.type === "time");
       const valueIdx = fields.findIndex((f) => f.type === "number");
-
       if (timeIdx === -1 || valueIdx === -1) continue;
 
-      const timestamps = (dataValues[timeIdx] as number[]) ?? [];
-      const values = (dataValues[valueIdx] as number[]) ?? [];
+      const timestampsRaw = (dataValues[timeIdx] as unknown[]) ?? [];
+      const valuesRaw = (dataValues[valueIdx] as unknown[]) ?? [];
+      const { timestamps, values } = sanitizeNumericSeries(
+        timestampsRaw,
+        valuesRaw,
+      );
       const name = fields[valueIdx]?.name ?? refId;
 
       if (timestamps.length > 0 && values.length > 0) {
@@ -115,24 +142,39 @@ function extractTimeSeries(frames: unknown): Array<{ name: string; timestamps: n
   return series;
 }
 
-export async function detectAnomaly(input: DetectAnomalyInput): Promise<string> {
-  const data = await grafanaGet<DashboardResponse>(`/api/dashboards/uid/${input.uid}`);
-  const panel = data.dashboard.panels.find((p) => p.id === input.panelId);
+export async function detectAnomaly(
+  input: DetectAnomalyInput,
+): Promise<string> {
+  const data = await grafanaGet<DashboardResponse>(
+    `/api/dashboards/uid/${input.uid}`,
+  );
+  const flatPanels = flattenPanels(data.dashboard.panels ?? []);
+  const panel = flatPanels.find((p) => p.id === input.panelId);
+  const templateValues = getTemplateValueMap(data.dashboard.templating?.list);
 
   if (!panel) {
-    const ids = data.dashboard.panels.map((p) => `${p.id}: ${p.title}`).join(", ");
+    const ids = flatPanels
+      .filter((p) => typeof p.id === "number")
+      .map((p) => `${p.id}: ${p.title ?? ""}`)
+      .join(", ");
     throw new Error(`Panel ${input.panelId} not found. Available: ${ids}`);
   }
 
-  if (!panel.targets?.length || !panel.datasource?.uid) {
-    throw new Error(`Panel "${panel.title}" has no queryable targets.`);
+  if (!panel.targets?.length) {
+    throw new Error(`Panel "${panel.title ?? ""}" has no queryable targets.`);
   }
 
-  const queries = panel.targets.map((target, i) => ({
-    ...target,
-    refId: target.refId ?? String.fromCharCode(65 + i),
-    datasource: panel.datasource,
-  }));
+  const { queries, unresolvedTargetIndexes } = await buildPanelQueries(
+    panel,
+    templateValues,
+    grafanaGet,
+  );
+
+  if (queries.length === 0) {
+    throw new Error(
+      `Panel "${panel.title ?? ""}" has no queryable targets after datasource resolution.`,
+    );
+  }
 
   const result = await grafanaPost("/api/ds/query", {
     queries,
@@ -143,17 +185,31 @@ export async function detectAnomaly(input: DetectAnomalyInput): Promise<string> 
   const allSeries = extractTimeSeries(result);
 
   if (allSeries.length === 0) {
-    return JSON.stringify({
-      panel: { id: panel.id, title: panel.title },
-      timeRange: { from: input.from, to: input.to },
-      message: "No time series data returned from panel queries.",
-      anomalies: [],
-    }, null, 2);
+    return JSON.stringify(
+      {
+        panel: { id: panel.id, title: panel.title ?? "" },
+        timeRange: { from: input.from, to: input.to },
+        warnings:
+          unresolvedTargetIndexes.length > 0
+            ? [
+                `Skipped targets with unresolved datasource at indexes: ${unresolvedTargetIndexes.join(", ")}`,
+              ]
+            : [],
+        message: "No time series data returned from panel queries.",
+        anomalies: [],
+      },
+      null,
+      2,
+    );
   }
 
   const seriesResults = allSeries.map((s) => {
     const stats = computeStats(s.values);
-    const anomalies = detectAnomalies(s.timestamps, s.values, input.sensitivity);
+    const anomalies = detectAnomalies(
+      s.timestamps,
+      s.values,
+      input.sensitivity,
+    );
     return {
       name: s.name,
       stats: {
@@ -168,13 +224,26 @@ export async function detectAnomaly(input: DetectAnomalyInput): Promise<string> 
     };
   });
 
-  const totalAnomalies = seriesResults.reduce((sum, s) => sum + s.anomalyCount, 0);
+  const totalAnomalies = seriesResults.reduce(
+    (sum, s) => sum + s.anomalyCount,
+    0,
+  );
 
-  return JSON.stringify({
-    panel: { id: panel.id, title: panel.title },
-    timeRange: { from: input.from, to: input.to },
-    sensitivity: input.sensitivity,
-    totalAnomalies,
-    series: seriesResults,
-  }, null, 2);
+  return JSON.stringify(
+    {
+      panel: { id: panel.id, title: panel.title ?? "" },
+      timeRange: { from: input.from, to: input.to },
+      warnings:
+        unresolvedTargetIndexes.length > 0
+          ? [
+              `Skipped targets with unresolved datasource at indexes: ${unresolvedTargetIndexes.join(", ")}`,
+            ]
+          : [],
+      sensitivity: input.sensitivity,
+      totalAnomalies,
+      series: seriesResults,
+    },
+    null,
+    2,
+  );
 }

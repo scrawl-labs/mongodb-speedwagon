@@ -4,7 +4,16 @@ import { searchDashboardsSchema, searchDashboards } from "./tools/search.js";
 import { getDashboardSchema, getDashboard } from "./tools/get-dashboard.js";
 import { queryPanelSchema, queryPanel } from "./tools/query-panel.js";
 import { detectAnomalySchema, detectAnomaly } from "./tools/detect-anomaly.js";
-import { incidentTimelineSchema, incidentTimeline } from "./tools/incident-timeline.js";
+import {
+  incidentTimelineSchema,
+  incidentTimeline,
+} from "./tools/incident-timeline.js";
+import {
+  dailyReportSchema,
+  dailyReport,
+  dailyMorningBriefingSchema,
+  dailyMorningBriefing,
+} from "./tools/daily-report.js";
 
 runMcpServer({
   name: "speedwagon-grafana",
@@ -49,6 +58,22 @@ runMcpServer({
       inputSchema: incidentTimelineSchema,
       annotations: { readOnlyHint: true },
       handler: incidentTimeline,
+    }),
+    defineTool({
+      name: "daily_morning_report",
+      description:
+        "Generate a morning report for today's dashboard metrics (latest/avg/min/max) and optionally check Elasticsearch HTTP 500 errors for the same period.",
+      inputSchema: dailyReportSchema,
+      annotations: { readOnlyHint: true },
+      handler: dailyReport,
+    }),
+    defineTool({
+      name: "daily_morning_briefing",
+      description:
+        "Generate one combined morning briefing across multiple dashboards. Reuses daily morning reports and aggregates success/failure and HTTP 500 totals.",
+      inputSchema: dailyMorningBriefingSchema,
+      annotations: { readOnlyHint: true },
+      handler: dailyMorningBriefing,
     }),
   ],
 }).catch((error) => {
